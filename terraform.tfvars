@@ -1,0 +1,9 @@
+backend_size  = 2
+backend_name  = "backend"
+frontend_size = 2
+frontend_name = "nginx"
+system_user   = "ubuntu"
+iqn_base      = "iqn.2024-12.otus-hl"
+vg_name       = "vg01"
+lv_name       = "lv01"
+fs_name       = "fs01"
