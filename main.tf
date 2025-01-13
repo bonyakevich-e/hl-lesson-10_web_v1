@@ -137,6 +137,46 @@ resource "yandex_compute_instance" "frontend" {
   }
 }
 
+# создаем target group, которую позже будем использовать в баллансировщике
+resource "yandex_lb_target_group" "frontend-target-group" {
+  name = "frontend-target-group"
+
+  target {
+    subnet_id = yandex_vpc_subnet.subnet01.id
+    address   = yandex_compute_instance.frontend[0].network_interface.0.ip_address
+  }
+
+  target {
+    subnet_id = yandex_vpc_subnet.subnet01.id
+    address   = yandex_compute_instance.frontend[1].network_interface.0.ip_address
+  }
+
+}
+
+resource "yandex_lb_network_load_balancer" "frontend-load-balancer" {
+  name = "frontend-load-balancer"
+
+  listener {
+    name = "http-listener"
+    port = 80
+    external_address_spec {
+      ip_version = "ipv4"
+    }
+  }
+
+  attached_target_group {
+    target_group_id = yandex_lb_target_group.frontend-target-group.id
+
+    healthcheck {
+      name = "http"
+      http_options {
+        port = 80
+        path = "/"
+      }
+    }
+  }
+}
+
 # создаем inventory файл для Ansible
 resource "local_file" "inventory" {
   filename        = "./hosts"
@@ -169,17 +209,23 @@ resource "local_file" "playbook_yml" {
   filename        = "./playbook.yml"
   file_permission = "0644"
   content = templatefile("playbook.tmpl.yml", {
-    remote_user  = var.system_user,
-    backend_name = var.backend_name,
-    backend_size = var.backend_size,
-    database     = yandex_compute_instance.database,
-    storage      = yandex_compute_instance.storage,
-    backend      = yandex_compute_instance.backend[*],
-    frontend     = yandex_compute_instance.frontend[*]
-    iqn_base     = var.iqn_base,
-    vg_name      = var.vg_name,
-    lv_name      = var.lv_name,
-    fs_name      = var.fs_name
+    remote_user           = var.system_user,
+    backend_name          = var.backend_name,
+    backend_size          = var.backend_size,
+    database              = yandex_compute_instance.database,
+    storage               = yandex_compute_instance.storage,
+    backend               = yandex_compute_instance.backend[*],
+    frontend              = yandex_compute_instance.frontend[*]
+    iqn_base              = var.iqn_base,
+    vg_name               = var.vg_name,
+    lv_name               = var.lv_name,
+    fs_name               = var.fs_name,
+    mysql_root_password   = var.mysql_root_password,
+    nc_db_username        = var.nc_db_username,
+    nc_db_password        = var.nc_db_password,
+    nc_web_admin_name     = var.nc_web_admin_name,
+    nc_web_admin_password = var.nc_web_admin_password
+
   })
 }
 
@@ -191,6 +237,16 @@ resource "local_file" "setup_iscsi_target" {
     iqn_base     = var.iqn_base,
     backend      = yandex_compute_instance.backend[*],
     backend_name = var.backend_name
+  })
+
+}
+
+# генерируем конфигурационный файл nginx
+resource "local_file" "frontend-balancer-conf" {
+  filename        = "./templates/frontend-balancer.conf"
+  file_permission = "0644"
+  content = templatefile("./templates/frontend-balancer.conf.tmpl", {
+    backend = yandex_compute_instance.backend[*],
   })
 
 }

@@ -85,6 +85,14 @@ ${database.network_interface.0.ip_address}	${database.hostname}\n
       regexp: '^InitiatorName='
       line: InitiatorName=${iqn_base}:${backend_name}.{{ inventory_hostname }}
 
+# настраиваем автоподключение iscsi диска при запуске системы
+  - name: Configure iscsi client to autoconnect after reboot
+    tags: set iscsi autoconnect
+    ansible.builtin.lineinfile:
+      path: /etc/iscsi/iscsid.conf
+      regexp: '^node.startup'
+      line: node.startup = automatic
+
   - name: restart iscsid
     service: 
       name: iscsid
@@ -215,6 +223,10 @@ ${database.network_interface.0.ip_address}	${database.hostname}\n
     failed_when:
       - result.rc != 0 and "already exists" not in result.stderr
 
+  - name: wait 30 seconds
+    ansible.builtin.wait_for:
+      timeout: 30
+
 # создаем кластерный VG на iscsi диске
   - name: create a PV and VG
     tags: set vg
@@ -300,6 +312,7 @@ ${database.network_interface.0.ip_address}	${database.hostname}\n
         - php-xml
         - php-imagick
         - php-zip
+        - mariadb-client
       state: present
       update_cache: true
     notify: restart apache2
@@ -354,9 +367,9 @@ ${database.network_interface.0.ip_address}	${database.hostname}\n
   become: yes
   tasks:
 
-  - name: Extact nextcloud-29.0.7.tar.bz2 into storage directory
+  - name: Extact nextcloud-30.0.4.tar.bz2 into storage directory
     ansible.builtin.unarchive:
-      src: https://cloud.baltbereg.com/index.php/s/rj9RanHNRaon5Lz/download/nextcloud-30.0.4.tar.bz2
+      src: https://cloud.baltbereg.com/index.php/s/2jYe3GPRPgCBPK9/download/nextcloud-30.0.4.tar.bz2
       dest: /var/www
       remote_src: yes
 
@@ -367,3 +380,244 @@ ${database.network_interface.0.ip_address}	${database.hostname}\n
       recurse: yes
       owner: www-data
       group: www-data
+
+# ============================ setup database MariaDB ===================
+
+- hosts: ${database.hostname}
+  tags: setup database
+  remote_user: ubuntu
+  become: yes
+  tasks:
+
+  - name: Generate an OpenSSH keypair with the default values (4096 bits, rsa)
+    community.crypto.openssh_keypair:
+      path: /root/.ssh/id_rsa
+
+  - name: Install pip
+    ansible.builtin.apt:
+      name: python3-pip
+      state: present
+      update_cache: true
+
+  - name: Install PyMySQL
+    pip:
+      name: pymysql
+      state: present
+      break_system_packages: true
+
+  - name: install mariadb
+    ansible.builtin.apt:
+      name:
+        - mariadb-server
+        - mariadb-backup
+        - mariadb-client
+      state: present
+      update_cache: true
+
+  - name: enable mariadb
+    ansible.builtin.service:
+      name: mariadb
+      enabled: true
+
+  - name: copy mariadb settings file
+    ansible.builtin.template:
+      src: 50-server.cnf.j2
+      dest: /etc/mysql/mariadb.conf.d/50-server.cnf
+      mode: '0600'
+    notify: restart mariadb
+
+  - name: flush handlers
+    meta: flush_handlers
+
+  - name: Check if mysql root password was not set
+    shell: >
+      mysql -u root
+      -h localhost
+      -e "quit"
+    changed_when: false
+    ignore_errors: true
+    register: check_passwd_root
+
+  - name: Set MariaDB root password
+    community.mysql.mysql_user:
+      name: root
+      password: ${mysql_root_password}
+      login_user: root
+      login_unix_socket: "/run/mysqld/mysqld.sock"
+      state: present
+    when: check_passwd_root.rc == 0
+
+  - name: Removes all anonymous user accounts
+    community.mysql.mysql_user:
+      name: ''
+      host_all: true
+      state: absent
+      login_user: root
+      login_password: ${mysql_root_password}
+    notify: flush privileges
+
+  - name: Remove test database
+    mysql_db:
+      login_user: "root"
+      login_password: ${mysql_root_password}
+      db: "test"
+      state: absent
+    notify: flush privileges
+
+#  - name: create replication user
+#    community.mysql.mysql_user:
+#      name: "{{ repl_user_name }}"
+#      password: "{{ repl_user_password }}"
+#      priv: '*.*:RELOAD,SUPER,REPLICATION SLAVE,REPLICATION CLIENT'
+#      host: '192.168.56.41'
+#      login_user: root
+#      login_password: "{{ mysql_root_password }}"
+#      state: present
+#    notify: flush privileges
+
+#  - name: create backup user
+#    tags: create_backup_user
+#    community.mysql.mysql_user:
+#      name: "{{ backup_user_name }}"
+#      password: "{{ backup_user_password }}"
+#      priv: '*.*:ALL'
+#      host: '%'
+#      login_user: root
+#      login_password: "{{ mysql_root_password }}"
+#      state: present
+#    notify: flush privileges
+
+  - name: create nextcloud database
+    community.mysql.mysql_db:
+      name: nextcloud
+      encoding: utf8mb4
+      collation: utf8mb4_general_ci
+      state: present
+      login_user: root
+      login_password: ${mysql_root_password}
+
+  - name: create nextcloud user
+    tags: create_nextcloud_user
+    community.mysql.mysql_user:
+      name: ${nc_db_username}
+      password: ${nc_db_password}
+      priv: 'nextcloud.*:ALL'
+      host: '%'
+      login_user: root
+      login_password: ${mysql_root_password}
+      state: present
+    notify: flush privileges
+
+  handlers:
+  - name: flush privileges
+    command: mysql -u root -p${mysql_root_password} -e "FLUSH PRIVILEGES"
+
+  - name: restart mariadb
+    ansible.builtin.service:
+      name: mariadb
+      state: restarted
+
+# =========================== make Nextcloud initial setup ========================
+
+- hosts: ${backend[0].hostname}
+  tags: nextcloud init
+  remote_user: ubuntu
+  become: yes
+  tasks:  
+
+  - name: make initial configuration of Nextcloud
+    command: sudo -u www-data php occ  maintenance:install --database-host='${database.hostname}' --database='mysql' --database-name='nextcloud' --database-user='${nc_db_username}' --database-pass='${nc_db_password}' --admin-user='${nc_web_admin_name}' --admin-pass='${nc_web_admin_password}'
+    args: 
+      chdir: /var/www/nextcloud
+
+  - name: add trusted domains to nextcloud config.php
+    tags: add trusted domains
+    ansible.builtin.lineinfile:
+      path: /var/www/nextcloud/config/config.php
+      insertafter: 0 => 'localhost',
+      line: "    1 => 'otus.highload.com',"
+
+# ========================== setup fronend ===================================
+
+- hosts: frontend
+  tags: setup frontend
+  remote_user: ubuntu
+  become: yes
+  tasks: 
+
+#  - name: Add Angie repository
+#    tags: add angie repo
+#    block:
+#      - name: angie repo | add repo's key to trusted
+#        ansible.builtin.get_url:
+#          url: https://angie.software/keys/angie-signing.gpg
+#          dest: /etc/apt/trusted.gpg.d/angie-signing.gpg
+
+#      - name: angie repo | add repo to repo's list
+#        ansible.builtin.apt_repository:
+#          repo: "deb https://download.angie.software/angie/ubuntu/24.04 noble main"
+#          state: present
+
+  - name: UnInstall angie
+    tags: uninstall angie
+    ansible.builtin.apt: 
+      name: angie
+      state: absent
+      update_cache: true
+
+#  - name: Copy angie balancer config
+#    tags: copy angie balancer config
+#    ansible.builtin.copy:
+#      src: 'templates/frontend-balancer.conf'
+#      dest: '/etc/angie/http.d/frontend-balancer.conf'
+#    notify: restart angie
+
+  - name: UnInstall angie-console-light
+    tags: uninstall angie console
+    ansible.builtin.apt: 
+      name: angie-console-light
+      state: absent
+      update_cache: true
+
+  #  - name: Copy angie console configuration
+  #    tags: copy angie console config
+  #    ansible.builtin.copy:
+  #      src: 'templates/angie-console.conf'
+  #      dest: '/etc/angie/http.d/angie-console.conf'
+  #    notify: restart angie
+
+
+  - name: Install nginx
+    tags: install nginx
+    ansible.builtin.apt: 
+      name: nginx
+      state: present
+      update_cache: true
+
+
+  - name: Copy nginx config
+    tags: copy nginx config
+    ansible.builtin.copy:
+      src: 'templates/frontend-balancer.conf'
+      dest: '/etc/nginx/sites-enabled/frontend-balancer.conf'
+    notify: restart nginx
+
+
+
+  handlers: 
+  
+#  - name: restart angie
+#    ansible.builtin.service:
+#      name: angie
+#      state: restarted
+
+  - name: restart nginx
+    ansible.builtin.service:
+      name: nginx
+      state: restarted 
+
+# закончил на
+# нужно поставить angie console с помощью ansible (устанавливаем пакет angie-console-light и копируем в httpd конфиг angie-console.conf). зайти можно по ссылке
+#http://ip/console/
+
+# когда выключаешь один первый бекенд, на второй не перебрасываются запросы. Консоль показывает что актвны два бэкенда, даже если первый выключить.
